@@ -1,0 +1,143 @@
+:root {
+  color-scheme: light;
+  font-family:
+    ui-sans-serif,
+    -apple-system,
+    BlinkMacSystemFont,
+    'Segoe UI',
+    sans-serif;
+  background: #f5f5f3;
+  color: #171717;
+}
+
+body {
+  margin: 0;
+  background:
+    radial-gradient(circle at top left, rgba(236, 232, 224, 0.95), transparent 30%),
+    linear-gradient(180deg, #f8f7f2 0%, #f1f0ea 100%);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+.options-shell {
+  max-width: 920px;
+  margin: 0 auto;
+  padding: 32px 20px 48px;
+}
+
+.options-hero,
+.options-card {
+  border: 1px solid rgba(23, 23, 23, 0.08);
+  border-radius: 22px;
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: 0 18px 48px rgba(15, 23, 42, 0.06);
+}
+
+.options-hero {
+  padding: 24px;
+  margin-bottom: 18px;
+}
+
+.options-card {
+  padding: 20px;
+}
+
+.options-grid {
+  display: grid;
+  gap: 18px;
+}
+
+.options-eyebrow {
+  margin: 0 0 10px;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #6b6b63;
+}
+
+.options-title {
+  margin: 0;
+  font-size: 34px;
+  line-height: 1.05;
+  letter-spacing: -0.04em;
+}
+
+.options-copy,
+.options-muted {
+  margin: 10px 0 0;
+  color: #57534e;
+  line-height: 1.5;
+}
+
+.options-card h2 {
+  margin: 0 0 8px;
+  font-size: 18px;
+  letter-spacing: -0.02em;
+}
+
+.options-field {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.options-field + .options-field {
+  margin-top: 14px;
+}
+
+.options-field label {
+  font-size: 13px;
+  font-weight: 600;
+  color: #44403c;
+}
+
+.options-field input {
+  width: 100%;
+  border-radius: 14px;
+  border: 1px solid rgba(23, 23, 23, 0.12);
+  background: rgba(255, 255, 255, 0.98);
+  padding: 12px 14px;
+  color: #171717;
+}
+
+.options-meta {
+  padding: 14px;
+  border-radius: 14px;
+  background: #f7f6f2;
+  border: 1px solid rgba(23, 23, 23, 0.06);
+}
+
+.options-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 18px;
+}
+
+.options-button-primary,
+.options-button-secondary {
+  border-radius: 12px;
+  padding: 10px 14px;
+  cursor: pointer;
+}
+
+.options-button-primary {
+  background: #171717;
+  color: #f9f8f4;
+  border: 1px solid #171717;
+}
+
+.options-button-secondary {
+  background: #f7f6f2;
+  color: #171717;
+  border: 1px solid rgba(23, 23, 23, 0.08);
+}
