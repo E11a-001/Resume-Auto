@@ -1,6 +1,15 @@
 import { fillField } from '../lib/forms/fill-fields';
 import { readFieldLabel, scanFields } from '../lib/forms/scan-fields';
 import { mapFieldToProfileKey } from '../lib/forms/semantic-map';
+import type { SmartFillSuggestion } from '../lib/ai/smart-fill';
+import {
+  extractResumeNarratives,
+  extractStructuredResumeEntries,
+  pickNarrative,
+  pickStructuredEntry,
+  type StructuredResumeEntry
+} from '../lib/import/resume-narratives';
+import { extractJobKeywords, optimizeNarrativeForJob } from '../lib/jd/narrative-optimizer';
 import type { RememberedResume } from '../lib/import/pdf-session-store';
 import { detectApplicationPage } from '../lib/page/detect-application-page';
 import type { PageSession } from '../lib/schema/page-session';
@@ -65,17 +74,99 @@ function extractResumeFacts(resume: RememberedResume | null) {
   };
 }
 
-function jdKeywords(jobDescription: string) {
-  return Array.from(new Set(jobDescription.match(/\b[A-Za-z][A-Za-z0-9+-]{3,}\b/g) ?? [])).slice(0, 6);
+function narrativeKindForField(mapping: ReturnType<typeof mapFieldToProfileKey>) {
+  if (mapping.target === 'projectDescription') {
+    return 'project' as const;
+  }
+
+  if (mapping.target !== 'experienceDescription') {
+    return null;
+  }
+
+  const experienceTypes = mapping.experienceTypes ? [...mapping.experienceTypes] : [];
+
+  if (experienceTypes.includes('internship') && !experienceTypes.includes('full_time')) {
+    return 'internship' as const;
+  }
+
+  return 'work' as const;
+}
+
+function entryKindForField(mapping: ReturnType<typeof mapFieldToProfileKey>) {
+  if (mapping.target === 'projectName' || mapping.target === 'projectDescription') {
+    return 'project' as const;
+  }
+
+  if (mapping.target !== 'companyName' && mapping.target !== 'jobTitle' && mapping.target !== 'experienceDescription') {
+    return null;
+  }
+
+  const experienceTypes = mapping.experienceTypes ? [...mapping.experienceTypes] : [];
+
+  if (experienceTypes.includes('internship') && !experienceTypes.includes('full_time')) {
+    return 'internship' as const;
+  }
+
+  return 'work' as const;
+}
+
+type StructuredEntryState = Record<
+  'internship' | 'work' | 'project',
+  {
+    index: number;
+    current: StructuredResumeEntry | null;
+  }
+>;
+
+function resolveStructuredEntry(
+  kind: 'internship' | 'work' | 'project',
+  mapping: ReturnType<typeof mapFieldToProfileKey>,
+  structuredEntries: ReturnType<typeof extractStructuredResumeEntries>,
+  structuredState: StructuredEntryState
+) {
+  const state = structuredState[kind];
+  const startsEntry = mapping.target === 'companyName' || mapping.target === 'projectName';
+
+  if (!state.current) {
+    state.current = pickStructuredEntry(
+      structuredEntries,
+      kind,
+      {
+        internship: structuredState.internship.index,
+        work: structuredState.work.index,
+        project: structuredState.project.index
+      }
+    );
+
+    if (state.current) {
+      state.index += 1;
+    }
+
+    return state.current;
+  }
+
+  if (startsEntry) {
+    const nextEntry = structuredEntries[kind][state.index] ?? null;
+
+    if (nextEntry) {
+      state.current = nextEntry;
+      state.index += 1;
+    }
+  }
+
+  return state.current;
 }
 
 function buildQuestionDraft(
   facts: ReturnType<typeof extractResumeFacts>,
   jobDescription: string
 ) {
-  const keywords = jdKeywords(jobDescription);
+  const keywords = extractJobKeywords(jobDescription);
   const keywordText = keywords.length > 0 ? ` aligned with ${keywords.slice(0, 3).join(', ')}` : '';
-  const summary = facts.experienceSummary || facts.profileSummary || 'hands-on analytical and operational work';
+  const summary = optimizeNarrativeForJob(
+    facts.experienceSummary || facts.profileSummary || 'hands-on analytical and operational work',
+    jobDescription
+  );
 
   return `I am excited about this opportunity because my background in ${summary}${keywordText} matches the role's priorities. I can contribute quickly, learn fast, and communicate clearly while keeping the work grounded in real execution.`;
 }
@@ -88,12 +179,36 @@ function buildFieldValue(
   label: string,
   element: HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement,
   facts: ReturnType<typeof extractResumeFacts>,
-  jobDescription: string
+  jobDescription: string,
+  narratives: ReturnType<typeof extractResumeNarratives>,
+  structuredEntries: ReturnType<typeof extractStructuredResumeEntries>,
+  narrativeCursor: Record<'internship' | 'work' | 'project' | 'experience', number>,
+  structuredState: StructuredEntryState
 ) {
   const mapping = mapFieldToProfileKey({
     label,
     sectionHeading: findSectionHeading(element) ?? undefined
   });
+  const narrativeKind = narrativeKindForField(mapping);
+  const entryKind = entryKindForField(mapping);
+
+  if (entryKind && (mapping.target === 'companyName' || mapping.target === 'jobTitle' || mapping.target === 'projectName')) {
+    const entry = resolveStructuredEntry(entryKind, mapping, structuredEntries, structuredState);
+
+    if (entry) {
+      if (mapping.target === 'companyName' && entry.company) {
+        return { value: entry.company, status: 'needs-confirmation' as const };
+      }
+
+      if (mapping.target === 'jobTitle' && entry.title) {
+        return { value: entry.title, status: 'needs-confirmation' as const };
+      }
+
+      if (mapping.target === 'projectName' && entry.name) {
+        return { value: entry.name, status: 'needs-confirmation' as const };
+      }
+    }
+  }
 
   if (mapping.target === 'email' && facts.email) {
     return { value: facts.email, status: 'autofilled' as const };
@@ -127,8 +242,30 @@ function buildFieldValue(
     return { value: facts.experienceSummary, status: 'needs-confirmation' as const };
   }
 
+  if (entryKind && mapping.target === 'experienceDescription' && (element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement)) {
+    const entry = resolveStructuredEntry(entryKind, mapping, structuredEntries, structuredState);
+
+    if (entry?.description) {
+      return {
+        value: optimizeNarrativeForJob(entry.description, jobDescription),
+        status: 'needs-confirmation' as const
+      };
+    }
+  }
+
+  if (narrativeKind && (element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement)) {
+    const narrative = pickNarrative(narratives, narrativeKind, narrativeCursor);
+
+    if (narrative) {
+      return {
+        value: optimizeNarrativeForJob(narrative, jobDescription),
+        status: 'needs-confirmation' as const
+      };
+    }
+  }
+
   if (mapping.target === 'profileSummary' && facts.profileSummary) {
-    const keywords = jdKeywords(jobDescription);
+    const keywords = extractJobKeywords(jobDescription);
     const text = `${facts.profileSummary}${keywords.length > 0 ? ` Focused on ${keywords.join(', ')}.` : ''}`.trim();
     return { value: text, status: 'needs-confirmation' as const };
   }
@@ -145,6 +282,19 @@ function smartFillDocument(resume: RememberedResume | null, jobDescription: stri
   const openQuestions: string[] = [];
   const pageSession = detectApplicationPage(document);
   const facts = extractResumeFacts(resume);
+  const narratives = extractResumeNarratives(resume);
+  const structuredEntries = extractStructuredResumeEntries(resume);
+  const narrativeCursor = {
+    internship: 0,
+    work: 0,
+    project: 0,
+    experience: 0
+  };
+  const structuredState: StructuredEntryState = {
+    internship: { index: 0, current: null },
+    work: { index: 0, current: null },
+    project: { index: 0, current: null }
+  };
   const elements = document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>(
     'input, textarea, select'
   );
@@ -162,7 +312,16 @@ function smartFillDocument(resume: RememberedResume | null, jobDescription: stri
       return;
     }
 
-    const next = buildFieldValue(label, element, facts, jobDescription);
+    const next = buildFieldValue(
+      label,
+      element,
+      facts,
+      jobDescription,
+      narratives,
+      structuredEntries,
+      narrativeCursor,
+      structuredState
+    );
 
     if (next.value && (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement)) {
       lastFilledSnapshots.push({ element, value: element.value });
@@ -183,6 +342,64 @@ function smartFillDocument(resume: RememberedResume | null, jobDescription: stri
     }
 
     fields.push({ label, status: 'unmatched' });
+  });
+
+  return {
+    pageSession: {
+      ...pageSession,
+      status: fields.some((field) => field.status !== 'unmatched') ? 'filled' : pageSession.status
+    },
+    fields,
+    openQuestions
+  };
+}
+
+function applyAiSmartFillPlan(suggestions: SmartFillSuggestion[]): SmartFillResponse {
+  const fields: FieldReview[] = [];
+  const openQuestions: string[] = [];
+  const pageSession = detectApplicationPage(document);
+  const elements = Array.from(
+    document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>('input, textarea, select')
+  );
+  const suggestionMap = new Map(suggestions.map((suggestion) => [suggestion.id, suggestion]));
+
+  lastFilledSnapshots = [];
+
+  elements.forEach((element, index) => {
+    if (element instanceof HTMLInputElement && element.type === 'file') {
+      return;
+    }
+
+    const label = readFieldLabel(element);
+
+    if (!label) {
+      return;
+    }
+
+    const suggestion = suggestionMap.get(`field-${index}`);
+
+    if (!suggestion) {
+      fields.push({ label, status: 'unmatched' });
+      return;
+    }
+
+    if (suggestion.value) {
+      lastFilledSnapshots.push({ element, value: element.value });
+      fillField(element, suggestion.value);
+      fields.push({ label, status: suggestion.status, value: suggestion.value });
+
+      if (suggestion.status === 'needs-confirmation' && element instanceof HTMLTextAreaElement) {
+        openQuestions.push(label);
+      }
+
+      return;
+    }
+
+    if (suggestion.status === 'needs-confirmation' && element instanceof HTMLTextAreaElement) {
+      openQuestions.push(label);
+    }
+
+    fields.push({ label, status: suggestion.status });
   });
 
   return {
@@ -260,6 +477,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   if (message?.type === 'SMART_FILL') {
     sendResponse(smartFillDocument(message.resume ?? null, message.jobDescription ?? ''));
+  }
+
+  if (message?.type === 'APPLY_AI_SMART_FILL') {
+    sendResponse(applyAiSmartFillPlan(message.suggestions ?? []));
   }
 
   if (message?.type === 'UNDO_FILL') {

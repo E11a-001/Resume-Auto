@@ -120,6 +120,7 @@ textarea {
   display: flex;
   gap: 10px;
   flex-wrap: wrap;
+  align-items: center;
   margin-top: 18px;
 }
 
@@ -140,4 +141,18 @@ textarea {
   background: #f7f6f2;
   color: #171717;
   border: 1px solid rgba(23, 23, 23, 0.08);
+}
+
+.options-inline-status,
+.options-inline-error {
+  margin: 0;
+  font-size: 14px;
+}
+
+.options-inline-status {
+  color: #166534;
+}
+
+.options-inline-error {
+  color: #b91c1c;
 }

@@ -3,7 +3,7 @@ import {
   rememberedResumeFromFile,
   type RememberedResume
 } from '../lib/import/pdf-session-store';
-import { importPdfResume } from '../lib/import/pdf-importer';
+import { importPdfResumeSafely } from '../lib/import/pdf-importer';
 import { emptyProfile, type Profile } from '../lib/schema/profile';
 import { emptyAiSettings, type AiSettings } from '../lib/schema/settings';
 import {
@@ -20,17 +20,34 @@ export function App() {
   const [aiSettings, setAiSettings] = useState<AiSettings>(emptyAiSettings());
   const [rememberedResume, setRememberedResume] = useState<RememberedResume | null>(null);
   const [ready, setReady] = useState(false);
+  const [loadWarning, setLoadWarning] = useState('');
+  const [statusMessage, setStatusMessage] = useState('');
+  const [errorMessage, setErrorMessage] = useState('');
+  const [savingProfile, setSavingProfile] = useState(false);
+  const [uploadingResume, setUploadingResume] = useState(false);
+  const [savedProfileRecently, setSavedProfileRecently] = useState(false);
   const resumeInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    Promise.all([loadMasterProfile(), loadAiSettings(), loadRememberedResume()]).then(
-      ([storedProfile, storedSettings, storedResume]) => {
-        setProfile(storedProfile);
-        setAiSettings(storedSettings);
-        setRememberedResume(storedResume);
-        setReady(true);
+    Promise.allSettled([loadMasterProfile(), loadAiSettings(), loadRememberedResume()]).then((results) => {
+      const [profileResult, settingsResult, resumeResult] = results;
+
+      if (profileResult.status === 'fulfilled') {
+        setProfile(profileResult.value);
       }
-    );
+
+      if (settingsResult.status === 'fulfilled') {
+        setAiSettings(settingsResult.value);
+      }
+
+      if (resumeResult.status === 'fulfilled') {
+        setRememberedResume(resumeResult.value);
+      } else {
+        setLoadWarning('Resume cache could not be loaded, but you can still update settings.');
+      }
+
+      setReady(true);
+    });
   }, []);
 
   if (!ready) {
@@ -38,7 +55,25 @@ export function App() {
   }
 
   async function handleSave() {
-    await Promise.all([saveMasterProfile(profile), saveAiSettings(aiSettings)]);
+    setStatusMessage('');
+    setErrorMessage('');
+    setSavedProfileRecently(false);
+    setSavingProfile(true);
+
+    try {
+      await Promise.all([saveMasterProfile(profile), saveAiSettings(aiSettings)]);
+      const [storedProfile, storedSettings] = await Promise.all([loadMasterProfile(), loadAiSettings()]);
+
+      setProfile(storedProfile);
+      setAiSettings(storedSettings);
+      setSavedProfileRecently(true);
+      setStatusMessage('Settings saved locally.');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unable to save settings.';
+      setErrorMessage(`Save failed: ${message}`);
+    } finally {
+      setSavingProfile(false);
+    }
   }
 
   async function handleResumeChange(event: React.ChangeEvent<HTMLInputElement>) {
@@ -48,14 +83,32 @@ export function App() {
       return;
     }
 
-    const [nextResume, extractedText] = await Promise.all([rememberedResumeFromFile(file), importPdfResume(file)]);
-    const nextRememberedResume = {
-      ...nextResume,
-      extractedText
-    };
-    await saveRememberedResume(nextRememberedResume);
-    setRememberedResume(nextRememberedResume);
-    event.target.value = '';
+    setStatusMessage('');
+    setErrorMessage('');
+    setSavedProfileRecently(false);
+    setUploadingResume(true);
+
+    try {
+      const [nextResume, extractedText] = await Promise.all([rememberedResumeFromFile(file), importPdfResumeSafely(file)]);
+      const nextRememberedResume = {
+        ...nextResume,
+        extractedText
+      };
+
+      await saveRememberedResume(nextRememberedResume);
+      setRememberedResume(nextRememberedResume);
+      setStatusMessage(
+        extractedText
+          ? 'Resume saved for reuse on future application pages.'
+          : 'Resume saved, but readable PDF text was limited.'
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unable to save this PDF.';
+      setErrorMessage(`Resume upload failed: ${message}`);
+    } finally {
+      setUploadingResume(false);
+      event.target.value = '';
+    }
   }
 
   function handleReplaceResume() {
@@ -71,6 +124,7 @@ export function App() {
           The side panel stays focused on the current application page. This screen keeps the remembered resume
           metadata and AI connection details out of the main filling flow.
         </p>
+        {loadWarning ? <p className="options-muted">{loadWarning}</p> : null}
       </section>
 
       <div className="options-grid">
@@ -80,15 +134,25 @@ export function App() {
             <div className="options-meta">
               <strong>{rememberedResume.fileName}</strong>
               <p className="options-muted">Updated {new Date(rememberedResume.updatedAt).toLocaleString()}</p>
-              <button type="button" className="options-button-secondary" onClick={handleReplaceResume}>
-                Replace resume
+              <button
+                type="button"
+                className="options-button-secondary"
+                onClick={handleReplaceResume}
+                disabled={uploadingResume}
+              >
+                {uploadingResume ? 'Saving resume...' : 'Replace resume'}
               </button>
             </div>
           ) : (
             <>
               <p className="options-muted">No PDF resume saved yet.</p>
-              <button type="button" className="options-button-secondary" onClick={handleReplaceResume}>
-                Choose resume PDF
+              <button
+                type="button"
+                className="options-button-secondary"
+                onClick={handleReplaceResume}
+                disabled={uploadingResume}
+              >
+                {uploadingResume ? 'Saving resume...' : 'Choose resume PDF'}
               </button>
             </>
           )}
@@ -147,9 +211,11 @@ export function App() {
           </div>
 
           <div className="options-actions">
-            <button type="button" className="options-button-primary" onClick={handleSave}>
-              Save profile
+            <button type="button" className="options-button-primary" onClick={handleSave} disabled={savingProfile}>
+              {savingProfile ? 'Saving...' : savedProfileRecently ? 'Saved' : 'Save profile'}
             </button>
+            {statusMessage ? <p className="options-inline-status">{statusMessage}</p> : null}
+            {errorMessage ? <p className="options-inline-error">{errorMessage}</p> : null}
           </div>
         </section>
       </div>

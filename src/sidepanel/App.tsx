@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { createDeepSeekProvider } from '../lib/ai/cloud-provider';
+import { planSmartFill } from '../lib/ai/smart-fill';
 import { draftAnswer } from '../lib/answers/draft-answer';
+import type { FieldDescriptor } from '../lib/forms/semantic-map';
 import { bucketFieldReviews } from '../lib/forms/review-buckets';
-import { importPdfResume } from '../lib/import/pdf-importer';
+import { importPdfResumeSafely } from '../lib/import/pdf-importer';
 import { rememberedResumeFromFile, type RememberedResume } from '../lib/import/pdf-session-store';
 import { emptyPageSession, type PageSession } from '../lib/schema/page-session';
 import { emptyAiSettings, type AiSettings } from '../lib/schema/settings';
@@ -16,7 +18,7 @@ type SidepanelAppProps = {
 
 type ScanResult = {
   pageSession?: PageSession;
-  fields?: Array<{ label: string }>;
+  fields?: FieldDescriptor[];
 };
 
 type SmartFillResult = {
@@ -27,6 +29,18 @@ type SmartFillResult = {
 
 function hasChromeTabs() {
   return typeof chrome !== 'undefined' && !!chrome.tabs?.query && !!chrome.tabs.sendMessage;
+}
+
+function hasChromeScripting() {
+  return typeof chrome !== 'undefined' && !!chrome.scripting?.executeScript;
+}
+
+function isMissingReceiverError(error: unknown) {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  return /receiving end does not exist|could not establish connection/i.test(error.message);
 }
 
 async function withActiveTab<T>(callback: (tabId: number) => Promise<T>, fallback: T): Promise<T> {
@@ -44,12 +58,95 @@ async function withActiveTab<T>(callback: (tabId: number) => Promise<T>, fallbac
   return callback(activeTab.id);
 }
 
+async function ensureContentScript(tabId: number) {
+  if (!hasChromeScripting()) {
+    return false;
+  }
+
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    files: ['content.js']
+  });
+
+  return true;
+}
+
+async function sendMessageToTab<T>(tabId: number, message: unknown): Promise<T> {
+  try {
+    return (await chrome.tabs.sendMessage(tabId, message)) as T;
+  } catch (error) {
+    if (!isMissingReceiverError(error)) {
+      throw error;
+    }
+
+    const injected = await ensureContentScript(tabId);
+
+    if (!injected) {
+      throw error;
+    }
+
+    return (await chrome.tabs.sendMessage(tabId, message)) as T;
+  }
+}
+
 function trimResumePreview(text: string | undefined) {
   if (!text) {
     return '';
   }
 
   return text.replace(/\s+/g, ' ').trim().slice(0, 220);
+}
+
+function looksBrokenResumeText(text: string | undefined) {
+  if (!text) {
+    return true;
+  }
+
+  const normalized = text.toLowerCase();
+  const markers = ['/author', '/producer', '/creationdate', '/creator', '/moddate', 'endobj', 'xref'];
+
+  return markers.filter((marker) => normalized.includes(marker)).length >= 2;
+}
+
+function smartFillFlashMessage({
+  fields,
+  usedAi,
+  fallbackToLocal,
+  resumeText
+}: {
+  fields: FieldReview[];
+  usedAi: boolean;
+  fallbackToLocal: boolean;
+  resumeText: string | undefined;
+}) {
+  const filledCount = fields.filter((field) => field.status === 'autofilled').length;
+  const reviewCount = fields.filter((field) => field.status === 'needs-confirmation').length;
+
+  if (filledCount + reviewCount === 0) {
+    if (looksBrokenResumeText(resumeText)) {
+      return 'The saved PDF still looks like raw PDF metadata, so Smart Fill does not have usable resume text yet.';
+    }
+
+    return 'This page uses structured application fields, but the current resume text could not map them yet.';
+  }
+
+  if (usedAi) {
+    return 'Used DeepSeek to tailor page-level fill suggestions before writing to the form.';
+  }
+
+  if (fallbackToLocal) {
+    return 'DeepSeek planning failed, so Smart Fill fell back to local field rules.';
+  }
+
+  return 'Filled confident matches directly into the page.';
+}
+
+function scanFlashMessage(fields: FieldDescriptor[]) {
+  if (fields.length === 0) {
+    return 'No visible fields were detected yet. If this page uses repeated sections like internship or project experience, click Add first to reveal enough rows.';
+  }
+
+  return `Detected ${fields.length} visible fields on this page.`;
 }
 
 export function App({ initialQuestions = [] }: SidepanelAppProps) {
@@ -86,9 +183,9 @@ export function App({ initialQuestions = [] }: SidepanelAppProps) {
   async function refreshPageSession() {
     await withActiveTab(
       async (tabId) => {
-        const response = (await chrome.tabs.sendMessage(tabId, {
+        const response = await sendMessageToTab<{ pageSession?: PageSession }>(tabId, {
           type: 'GET_PAGE_SESSION'
-        })) as { pageSession?: PageSession };
+        });
 
         if (response?.pageSession) {
           setPageSession(response.pageSession);
@@ -99,7 +196,7 @@ export function App({ initialQuestions = [] }: SidepanelAppProps) {
   }
 
   async function handleResumeFile(file: File) {
-    const [resume, extractedText] = await Promise.all([rememberedResumeFromFile(file), importPdfResume(file)]);
+    const [resume, extractedText] = await Promise.all([rememberedResumeFromFile(file), importPdfResumeSafely(file)]);
     const nextResume = {
       ...resume,
       extractedText
@@ -107,7 +204,11 @@ export function App({ initialQuestions = [] }: SidepanelAppProps) {
 
     await saveRememberedResume(nextResume);
     setRememberedResume(nextResume);
-    setFlashMessage('Saved this resume for future application pages.');
+    setFlashMessage(
+      extractedText
+        ? 'Saved this resume for future application pages.'
+        : 'Saved the resume, but readable PDF text was limited so some fields may still need review.'
+    );
   }
 
   async function handleFileInputChange(event: React.ChangeEvent<HTMLInputElement>) {
@@ -134,24 +235,32 @@ export function App({ initialQuestions = [] }: SidepanelAppProps) {
   async function handleScan() {
     setLoadingScan(true);
     setFlashMessage('');
+    let scanStarted = false;
 
     try {
       await withActiveTab(
         async (tabId) => {
-          const response = (await chrome.tabs.sendMessage(tabId, {
+          scanStarted = true;
+          const response = await sendMessageToTab<ScanResult>(tabId, {
             type: 'SCAN_FIELDS'
-          })) as ScanResult;
+          });
+          const nextFields = response?.fields ?? [];
 
           if (response?.pageSession) {
             setPageSession(response.pageSession);
           }
 
-          if (response?.fields) {
-            setFields(response.fields.map((field) => ({ label: field.label, status: 'unmatched' as const })));
-          }
+          setFields(nextFields.map((field) => ({ label: field.label, status: 'unmatched' as const })));
+          setFlashMessage(scanFlashMessage(nextFields));
         },
         undefined
       );
+      if (!scanStarted) {
+        setFlashMessage('Open the application page in the active tab before scanning.');
+      }
+    } catch (scanError) {
+      const message = scanError instanceof Error ? scanError.message : 'Scan failed on this page.';
+      setFlashMessage(message);
     } finally {
       setLoadingScan(false);
     }
@@ -167,13 +276,47 @@ export function App({ initialQuestions = [] }: SidepanelAppProps) {
     setFlashMessage('');
 
     try {
+      const currentSettings = await loadAiSettings();
+      setAiSettings(currentSettings);
+
       await withActiveTab(
         async (tabId) => {
-          const response = (await chrome.tabs.sendMessage(tabId, {
-            type: 'SMART_FILL',
-            resume: rememberedResume,
-            jobDescription
-          })) as SmartFillResult;
+          let response: SmartFillResult;
+          let usedAi = false;
+          let fallbackToLocal = false;
+
+          if (currentSettings.apiKey) {
+            try {
+              const scanResponse = await sendMessageToTab<ScanResult>(tabId, {
+                type: 'SCAN_FIELDS'
+              });
+              const provider = createDeepSeekProvider(currentSettings);
+              const plan = await planSmartFill(provider, {
+                fields: scanResponse.fields ?? [],
+                resumeText: rememberedResume.extractedText ?? '',
+                jobDescription
+              });
+
+              response = await sendMessageToTab<SmartFillResult>(tabId, {
+                type: 'APPLY_AI_SMART_FILL',
+                suggestions: plan.suggestions
+              });
+              usedAi = true;
+            } catch {
+              response = await sendMessageToTab<SmartFillResult>(tabId, {
+                type: 'SMART_FILL',
+                resume: rememberedResume,
+                jobDescription
+              });
+              fallbackToLocal = true;
+            }
+          } else {
+            response = await sendMessageToTab<SmartFillResult>(tabId, {
+              type: 'SMART_FILL',
+              resume: rememberedResume,
+              jobDescription
+            });
+          }
 
           if (response.pageSession) {
             setPageSession(response.pageSession);
@@ -182,10 +325,20 @@ export function App({ initialQuestions = [] }: SidepanelAppProps) {
           setFields(response.fields ?? []);
           setOpenQuestions(response.openQuestions ?? []);
           setSelectedQuestion(response.openQuestions?.[0] ?? '');
-          setFlashMessage('Filled confident matches directly into the page.');
+          setFlashMessage(
+            smartFillFlashMessage({
+              fields: response.fields ?? [],
+              usedAi,
+              fallbackToLocal,
+              resumeText: rememberedResume.extractedText
+            })
+          );
         },
         undefined
       );
+    } catch (fillError) {
+      const message = fillError instanceof Error ? fillError.message : 'Smart Fill failed.';
+      setFlashMessage(message);
     } finally {
       setLoadingFill(false);
     }
@@ -194,7 +347,7 @@ export function App({ initialQuestions = [] }: SidepanelAppProps) {
   async function handleUndo() {
     await withActiveTab(
       async (tabId) => {
-        await chrome.tabs.sendMessage(tabId, { type: 'UNDO_FILL' });
+        await sendMessageToTab(tabId, { type: 'UNDO_FILL' });
       },
       undefined
     );

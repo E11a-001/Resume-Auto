@@ -11,22 +11,9 @@ export const rememberedResumeSchema = z.object({
 
 export type RememberedResume = z.infer<typeof rememberedResumeSchema>;
 
-function bytesToBase64(bytes: Uint8Array): string {
-  let binary = '';
-
-  for (const byte of bytes) {
-    binary += String.fromCharCode(byte);
-  }
-
-  return btoa(binary);
-}
-
 export async function rememberedResumeFromFile(file: File): Promise<RememberedResume> {
-  const bytes = new Uint8Array(await file.arrayBuffer());
-
   return rememberedResumeSchema.parse({
     fileName: file.name,
-    updatedAt: new Date().toISOString(),
-    bytesBase64: bytesToBase64(bytes)
+    updatedAt: new Date().toISOString()
   });
 }
